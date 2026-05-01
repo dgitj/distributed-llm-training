@@ -1,0 +1,51 @@
+{
+  "train_batch_size": 32,
+  "train_micro_batch_size_per_gpu": 2,
+  "gradient_accumulation_steps": 4,
+  "steps_per_print": 10,
+
+  "_comment": "Experiment B: ZeRO Stage 3. Shards weights AND gradients AND optimizer states. Lowest VRAM but slower: requires an AllGather before every forward pass to reconstruct each layer's weights. The throughput drop vs ZeRO-2 measures the cost of weight sharding on your interconnect.",
+
+  "zero_optimization": {
+    "stage": 3,
+    "overlap_comm": true,
+    "contiguous_gradients": true,
+    "reduce_bucket_size": 2e8,
+
+    "stage3_prefetch_bucket_size": 1e8,
+    "stage3_param_persistence_threshold": 1e6,
+    "stage3_max_live_parameters": 1e9,
+    "stage3_max_reuse_distance": 1e9,
+
+    "stage3_gather_16bit_weights_on_model_save": true
+  },
+
+  "bf16": {
+    "enabled": true
+  },
+
+  "gradient_clipping": 1.0,
+
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": 2e-4,
+      "betas": [0.9, 0.95],
+      "eps": 1e-8,
+      "weight_decay": 0.1
+    }
+  },
+
+  "scheduler": {
+    "type": "WarmupDecayLR",
+    "params": {
+      "warmup_min_lr": 0,
+      "warmup_max_lr": 2e-4,
+      "warmup_num_steps": 20,
+      "total_num_steps": 300
+    }
+  },
+
+  "wall_clock_breakdown": true,
+  "dump_state": false
+}
