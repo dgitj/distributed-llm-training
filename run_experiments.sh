@@ -22,7 +22,7 @@ export NCCL_IB_DISABLE=0
 export NCCL_NET_GDR_LEVEL=2
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-PROJECT_DIR=$HOME/mixtral-zero2-showcase
+PROJECT_DIR=$HOME/llm-parallelism-showcase
 cd $PROJECT_DIR
 mkdir -p logs checkpoints profiling/traces
 
