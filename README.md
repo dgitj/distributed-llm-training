@@ -1,4 +1,4 @@
-# DistriBench-MoE: A Scaling & Parallelism Benchmark Framework
+# A Scaling & Parallelism Benchmark Framework
 
 This framework is designed to profile and analyze the performance trade-offs of distributed training strategies for Large Language Models. Using **Mixtral-8x7B** (a Mixture-of-Experts model) as a baseline, this project benchmarks various sharding and parallelization dimensions on HPC infrastructure.
 
