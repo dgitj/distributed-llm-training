@@ -31,11 +31,11 @@ The full framework investigates the synergistic effects of 3D-parallelism and qu
 *   **Pipeline Bubbles:** Benchmarking micro-batch sizes to minimize idle time between pipeline stages.
 *   **Inter-Node Bandwidth:** Analyzing throughput during activation transfers across physical server nodes.
 
-### 4. Expert Parallelism (EP) - MoE Specific
+### To be implemented: Expert Parallelism (EP) - MoE Specific
 *   **Expert Sharding:** Distributing the 8 experts across different GPUs.
 *   **All-to-All Latency:** Measuring network load during token routing to specific experts.
 
-### 5. Precision & Quantization Trade-offs
+### To be implemented: Precision & Quantization Trade-offs
 *   **BF16 vs. INT4 (QLoRA):** Quantifying dequantization overhead versus the gain in batch size capacity.
 
 ## 🚀 Key Features
