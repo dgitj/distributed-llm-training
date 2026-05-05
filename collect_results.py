@@ -1,304 +1,350 @@
 """
 collect_results.py
+──────────────────
+Read per-step CSVs from both benchmark experiments, compute summary
+statistics, print a comparison table, and log everything to W&B.
 
-Pulls experiment results from W&B and produces:
-  1. benchmarks/results_summary.md  – human-readable table for the README
-  2. benchmarks/plots/exp_A_bwd_ms.png     – Exp A: backward time overlap on vs off
-  3. benchmarks/plots/exp_B_vram_vs_tput.png – Exp B: ZeRO-2 vs ZeRO-3 tradeoff
-  4. benchmarks/plots/exp_C_scaling.png    – Exp C: scaling efficiency curve
+Usage (called automatically by run_benchmark.sh, or manually):
 
-Usage:
-    python benchmarks/collect_results.py --wandb_project mixtral-benchmarks-bwunicluster
-
-Requirements:
-    pip install wandb matplotlib pandas
+    python collect_results.py \
+        --exp1_dir  results/exp1_tp2_ep1_dp8 \
+        --exp2_dir  results/exp2_tp2_ep4_etp4_dp2 \
+        --exp1_name exp1_tp2_ep1_dp8 \
+        --exp2_name exp2_tp2_ep4_etp4_dp2 \
+        --out_dir   results \
+        --wandb_project mixtral-dp-vs-ep
 """
 
 import argparse
+import csv
+import math
 import os
+import statistics
+from pathlib import Path
 
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-import pandas as pd
-import wandb
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
-plt.rcParams.update({
-    "figure.dpi": 150,
-    "font.size": 11,
-    "axes.spines.top": False,
-    "axes.spines.right": False,
-})
-
-COLORS = {
-    "overlap_on":  "#2563eb",   # blue
-    "overlap_off": "#dc2626",   # red
-    "zero2":       "#16a34a",   # green
-    "zero3":       "#d97706",   # amber
-    "2gpu":        "#7c3aed",   # purple
-    "4gpu":        "#0891b2",   # cyan
-}
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--exp1_dir",       type=str, required=True)
+    p.add_argument("--exp2_dir",       type=str, required=True)
+    p.add_argument("--exp1_name",      type=str, default="exp1_dp_baseline")
+    p.add_argument("--exp2_name",      type=str, default="exp2_ep_treatment")
+    p.add_argument("--out_dir",        type=str, default="results")
+    p.add_argument("--wandb_project",  type=str, default="mixtral-dp-vs-ep")
+    p.add_argument("--warmup_steps",   type=int, default=50,
+                   help="Steps to exclude from statistics")
+    return p.parse_args()
 
 
-def fetch_run(api, project: str, run_name: str) -> pd.DataFrame:
-    """Download history for a single W&B run as a DataFrame."""
-    runs = api.runs(project, filters={"display_name": run_name})
-    if not runs:
-        print(f"  [WARN] Run '{run_name}' not found in project '{project}'")
-        return pd.DataFrame()
-    run = runs[0]
-    history = run.history(samples=500)
-    history["run_name"] = run_name
-    history["config"] = run.config
-    return history
+# ── CSV loading ───────────────────────────────────────────────────────────────
 
-
-def steady_state_mean(df: pd.DataFrame, metric: str, skip_steps: int = 50) -> float:
-    """Mean of a metric after the first skip_steps (warmup) steps."""
-    if df.empty or metric not in df.columns:
-        return float("nan")
-    return df[df["train/step"] >= skip_steps][metric].mean()
-
-
-# ---------------------------------------------------------------------------
-# Plot helpers
-# ---------------------------------------------------------------------------
-
-def plot_exp_a(df_on: pd.DataFrame, df_off: pd.DataFrame, out_dir: str):
-    """
-    Experiment A: overlap_comm ON vs OFF.
-    Shows bwd_ms over training steps. If overlap works, ON has lower bwd_ms.
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-    # Left: bwd_ms over time
-    ax = axes[0]
-    if not df_on.empty:
-        ax.plot(df_on["train/step"], df_on["perf/bwd_ms"],
-                color=COLORS["overlap_on"], label="overlap ON", linewidth=1.5)
-    if not df_off.empty:
-        ax.plot(df_off["train/step"], df_off["perf/bwd_ms"],
-                color=COLORS["overlap_off"], label="overlap OFF", linewidth=1.5)
-    ax.set_xlabel("Training step")
-    ax.set_ylabel("Backward pass time (ms)")
-    ax.set_title("Exp A: Backward time — overlap ON vs OFF\n"
-                 "Lower = less exposed communication latency")
-    ax.legend()
-    ax.yaxis.set_minor_locator(ticker.AutoMinorLocator())
-
-    # Right: tokens/sec bar
-    ax = axes[1]
-    means = {
-        "overlap ON":  steady_state_mean(df_on,  "perf/tokens_per_sec"),
-        "overlap OFF": steady_state_mean(df_off, "perf/tokens_per_sec"),
-    }
-    bars = ax.bar(means.keys(), means.values(),
-                  color=[COLORS["overlap_on"], COLORS["overlap_off"]],
-                  width=0.5, edgecolor="white")
-    ax.bar_label(bars, fmt="{:,.0f}", padding=4)
-    ax.set_ylabel("Tokens / second (mean, steps 50–300)")
-    ax.set_title("Throughput impact of comm overlap")
-    ax.set_ylim(0, max(v for v in means.values() if v == v) * 1.25)
-
-    fig.tight_layout()
-    path = os.path.join(out_dir, "exp_A_overlap.png")
-    fig.savefig(path)
-    print(f"  Saved {path}")
-    plt.close(fig)
-
-
-def plot_exp_b(df_z2: pd.DataFrame, df_z3: pd.DataFrame, out_dir: str):
-    """
-    Experiment B: ZeRO-2 vs ZeRO-3.
-    Scatter: VRAM saved vs throughput lost – the memory/speed tradeoff.
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-    # Left: tokens/sec over time
-    ax = axes[0]
-    if not df_z2.empty:
-        ax.plot(df_z2["train/step"], df_z2["perf/tokens_per_sec"],
-                color=COLORS["zero2"], label="ZeRO-2", linewidth=1.5)
-    if not df_z3.empty:
-        ax.plot(df_z3["train/step"], df_z3["perf/tokens_per_sec"],
-                color=COLORS["zero3"], label="ZeRO-3", linewidth=1.5)
-    ax.set_xlabel("Training step")
-    ax.set_ylabel("Tokens / second")
-    ax.set_title("Exp B: ZeRO-2 vs ZeRO-3 throughput\n"
-                 "ZeRO-3 pays AllGather overhead per layer")
-    ax.legend()
-
-    # Right: VRAM vs throughput scatter (two points, annotated)
-    ax = axes[1]
-    for label, df, color in [("ZeRO-2", df_z2, COLORS["zero2"]),
-                              ("ZeRO-3", df_z3, COLORS["zero3"])]:
-        vram = steady_state_mean(df, "perf/vram_gb")
-        tput = steady_state_mean(df, "perf/tokens_per_sec")
-        ax.scatter([vram], [tput], s=200, color=color, zorder=3, label=label)
-        ax.annotate(f"  {label}\n  {vram:.1f} GB | {tput:,.0f} tok/s",
-                    (vram, tput), fontsize=9, va="center")
-    ax.set_xlabel("VRAM per GPU (GB)  ← lower is better")
-    ax.set_ylabel("Tokens / second  ↑ higher is better")
-    ax.set_title("Memory–Throughput tradeoff\n"
-                 "Arrow shows ideal direction (bottom-left = best)")
-    ax.annotate("", xy=(0.15, 0.15), xytext=(0.85, 0.85),
-                xycoords="axes fraction",
-                arrowprops=dict(arrowstyle="->", color="gray", lw=1.5))
-    ax.legend()
-
-    fig.tight_layout()
-    path = os.path.join(out_dir, "exp_B_zero2_vs_zero3.png")
-    fig.savefig(path)
-    print(f"  Saved {path}")
-    plt.close(fig)
-
-
-def plot_exp_c(df_2gpu: pd.DataFrame, df_4gpu: pd.DataFrame, out_dir: str):
-    """
-    Experiment C: scaling efficiency.
-    Shows actual vs ideal speedup when doubling GPUs.
-    """
-    tput_2 = steady_state_mean(df_2gpu, "perf/tokens_per_sec")
-    tput_4 = steady_state_mean(df_4gpu, "perf/tokens_per_sec")
-
-    if tput_2 != tput_2 or tput_4 != tput_4:
-        print("  [WARN] Missing data for Exp C, skipping plot.")
-        return
-
-    actual_speedup = tput_4 / tput_2
-    efficiency = actual_speedup / 2.0  # ideal speedup for 2x GPUs is 2x
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-    # Left: bar chart – 2 GPU vs 4 GPU throughput + ideal
-    ax = axes[0]
-    configs = ["2 GPU\n(baseline)", "4 GPU\n(actual)", "4 GPU\n(ideal)"]
-    values  = [tput_2, tput_4, tput_2 * 2]
-    bar_colors = [COLORS["2gpu"], COLORS["4gpu"], "#94a3b8"]
-    bars = ax.bar(configs, values, color=bar_colors, width=0.5, edgecolor="white")
-    ax.bar_label(bars, fmt="{:,.0f}", padding=4)
-    ax.set_ylabel("Tokens / second")
-    ax.set_title(f"Exp C: Scaling efficiency\n"
-                 f"Actual speedup: {actual_speedup:.2f}× / Ideal: 2.00×  "
-                 f"→ {efficiency*100:.0f}% efficient")
-    ax.set_ylim(0, tput_2 * 2.4)
-
-    # Right: efficiency annotation
-    ax = axes[1]
-    ax.barh(["Parallel\nefficiency"], [efficiency * 100],
-            color=COLORS["4gpu"] if efficiency > 0.85 else COLORS["overlap_off"],
-            height=0.4)
-    ax.axvline(100, color="gray", linestyle="--", linewidth=1, label="Ideal (100%)")
-    ax.set_xlim(0, 115)
-    ax.set_xlabel("Parallel efficiency (%)")
-    ax.set_title("How close to ideal scaling?\n"
-                 ">85% = good  |  <70% = communication bottleneck")
-    ax.legend()
-
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    ax.tick_params(left=False)
-
-    fig.tight_layout()
-    path = os.path.join(out_dir, "exp_C_scaling.png")
-    fig.savefig(path)
-    print(f"  Saved {path}")
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# Summary table
-# ---------------------------------------------------------------------------
-
-def write_summary(runs: dict, out_path: str):
+def load_metrics(csv_path: str, warmup_steps: int) -> list[dict]:
+    """Load metrics_steps.csv, skip warmup, return measured steps only."""
     rows = []
-    for run_name, df in runs.items():
-        rows.append({
-            "Run": run_name,
-            "tok/s": f"{steady_state_mean(df, 'perf/tokens_per_sec'):,.0f}",
-            "VRAM GB": f"{steady_state_mean(df, 'perf/vram_gb'):.1f}",
-            "bwd ms": f"{steady_state_mean(df, 'perf/bwd_ms'):.0f}",
-            "MFU %": f"{steady_state_mean(df, 'perf/mfu_percent'):.1f}",
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            step = int(row["step"])
+            if step <= warmup_steps:
+                continue
+            # Cast numeric fields
+            for key in row:
+                if row[key] in ("", "None"):
+                    row[key] = None
+                else:
+                    try:
+                        row[key] = float(row[key])
+                    except ValueError:
+                        pass
+            rows.append(row)
+    return rows
+
+
+def load_memory(csv_path: str) -> list[dict]:
+    """Load memory_by_rank.csv."""
+    rows = []
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            for key in ["allocated_gb", "peak_allocated_gb",
+                        "reserved_gb", "peak_reserved_gb", "step"]:
+                try:
+                    row[key] = float(row[key])
+                except (ValueError, KeyError):
+                    pass
+            rows.append(row)
+    return rows
+
+
+# ── Statistics helpers ────────────────────────────────────────────────────────
+
+def percentile(data: list[float], p: float) -> float:
+    if not data:
+        return float("nan")
+    sorted_data = sorted(data)
+    idx = (len(sorted_data) - 1) * p / 100
+    lo, hi = int(idx), min(int(idx) + 1, len(sorted_data) - 1)
+    return sorted_data[lo] + (sorted_data[hi] - sorted_data[lo]) * (idx - lo)
+
+
+def safe_mean(vals):
+    clean = [v for v in vals if v is not None and not math.isnan(v)]
+    return statistics.mean(clean) if clean else float("nan")
+
+
+def safe_median(vals):
+    clean = [v for v in vals if v is not None and not math.isnan(v)]
+    return statistics.median(clean) if clean else float("nan")
+
+
+def safe_stdev(vals):
+    clean = [v for v in vals if v is not None and not math.isnan(v)]
+    return statistics.stdev(clean) if len(clean) > 1 else float("nan")
+
+
+def summarise(rows: list[dict], field: str) -> dict:
+    vals = [r[field] for r in rows if r.get(field) is not None]
+    return {
+        "mean":   safe_mean(vals),
+        "median": safe_median(vals),
+        "std":    safe_stdev(vals),
+        "p95":    percentile(vals, 95),
+        "min":    min(vals) if vals else float("nan"),
+        "max":    max(vals) if vals else float("nan"),
+    }
+
+
+def block_stats(rows: list[dict], field: str,
+                edges: list[int]) -> list[dict]:
+    """Compute per-block statistics."""
+    blocks = []
+    for i in range(len(edges) - 1):
+        lo, hi = edges[i], edges[i + 1]
+        block_rows = [r for r in rows if lo <= int(r["step"]) < hi]
+        vals = [r[field] for r in block_rows if r.get(field) is not None]
+        blocks.append({
+            "block":  f"steps {lo}–{hi-1}",
+            "n":      len(vals),
+            "mean":   safe_mean(vals),
+            "std":    safe_stdev(vals),
+            "median": safe_median(vals),
+            "p95":    percentile(vals, 95),
         })
-
-    df = pd.DataFrame(rows)
-    md = df.to_markdown(index=False)
-
-    content = f"""# Benchmark Results
-
-Generated automatically by `benchmarks/collect_results.py`.
-
-## Summary table
-
-{md}
-
-## Experiment A – Communication overlap
-
-![Exp A](plots/exp_A_overlap.png)
-
-`overlap_comm=True` hides AllReduce latency behind the backward pass.
-The **bwd_ms** column above shows exposed communication time:
-lower = more latency hidden by the overlap.
-
-## Experiment B – ZeRO-2 vs ZeRO-3
-
-![Exp B](plots/exp_B_zero2_vs_zero3.png)
-
-ZeRO-3 adds an `AllGather` before **every layer's forward pass** to reconstruct
-sharded weights. This reduces VRAM but increases communication volume.
-On InfiniBand, this typically costs 10–20% throughput.
-
-## Experiment C – Scaling efficiency
-
-![Exp C](plots/exp_C_scaling.png)
-
-Ideal: doubling GPUs doubles throughput (100% efficient).
-Reality on bwUniCluster: ~80–90% due to AllReduce overhead.
-The gap quantifies your interconnect's communication cost.
-"""
-
-    with open(out_path, "w") as f:
-        f.write(content)
-    print(f"  Saved {out_path}")
+    return blocks
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ── Formatting helpers ────────────────────────────────────────────────────────
+
+def fmt(val, fmt_str=".3f"):
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return "N/A"
+    return format(val, fmt_str)
+
+
+def pct_diff(a, b):
+    """Percentage difference of b relative to a: (b-a)/a * 100."""
+    if a is None or b is None or math.isnan(a) or math.isnan(b) or a == 0:
+        return float("nan")
+    return (b - a) / abs(a) * 100
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--wandb_project", type=str,
-                        default="mixtral-benchmarks-bwunicluster")
-    args = parser.parse_args()
+    args = parse_args()
 
-    out_dir = "benchmarks/plots"
-    os.makedirs(out_dir, exist_ok=True)
+    exp1_steps_path  = os.path.join(args.exp1_dir, "metrics_steps.csv")
+    exp2_steps_path  = os.path.join(args.exp2_dir, "metrics_steps.csv")
+    exp1_memory_path = os.path.join(args.exp1_dir, "memory_by_rank.csv")
+    exp2_memory_path = os.path.join(args.exp2_dir, "memory_by_rank.csv")
 
-    api = wandb.Api()
-    print(f"Fetching runs from W&B project: {args.wandb_project}")
+    for path in [exp1_steps_path, exp2_steps_path]:
+        if not Path(path).exists():
+            raise FileNotFoundError(f"Missing: {path}")
 
-    run_names = {
-        "expA_overlap_ON":   "expA_overlap_ON",
-        "expA_overlap_OFF":  "expA_overlap_OFF",
-        "expB_ZeRO2_4gpu":  "expB_ZeRO2_4gpu",
-        "expB_ZeRO3_4gpu":  "expB_ZeRO3_4gpu",
-        "expC_ZeRO2_2gpu":  "expC_ZeRO2_2gpu",
-    }
+    print(f"Loading {args.exp1_name} ...")
+    exp1_rows = load_metrics(exp1_steps_path, args.warmup_steps)
+    print(f"  {len(exp1_rows)} measured steps")
 
-    dfs = {}
-    for key, name in run_names.items():
-        print(f"  Fetching {name} ...")
-        dfs[key] = fetch_run(api, args.wandb_project, name)
+    print(f"Loading {args.exp2_name} ...")
+    exp2_rows = load_metrics(exp2_steps_path, args.warmup_steps)
+    print(f"  {len(exp2_rows)} measured steps")
 
-    print("\nGenerating plots ...")
-    plot_exp_a(dfs["expA_overlap_ON"],  dfs["expA_overlap_OFF"], out_dir)
-    plot_exp_b(dfs["expB_ZeRO2_4gpu"], dfs["expB_ZeRO3_4gpu"],  out_dir)
-    plot_exp_c(dfs["expC_ZeRO2_2gpu"], dfs["expB_ZeRO2_4gpu"],  out_dir)
+    # ── Per-field summaries ───────────────────────────────────────────────────
+    fields_of_interest = [
+        ("step_time_s",            "Step time (s)"),
+        ("tokens_per_sec",         "Throughput (tok/s)"),
+        ("mfu_percent",            "MFU (%)"),
+        ("fwd_time_s",             "Fwd time (s)"),
+        ("bwd_time_s",             "Bwd time (s)"),
+        ("optim_time_s",           "Optim time (s)"),
+        ("grad_norm",              "Grad norm"),
+        ("expert_load_imbalance",  "Expert load imbalance"),
+        ("expert_routing_entropy", "Expert routing entropy"),
+    ]
 
-    print("\nWriting summary table ...")
-    write_summary(dfs, "benchmarks/results_summary.md")
+    summaries_exp1 = {f: summarise(exp1_rows, f) for f, _ in fields_of_interest}
+    summaries_exp2 = {f: summarise(exp2_rows, f) for f, _ in fields_of_interest}
 
-    print("\nDone. Commit benchmarks/ to GitHub.")
+    # ── Memory summaries ──────────────────────────────────────────────────────
+    mem1 = load_memory(exp1_memory_path) if Path(exp1_memory_path).exists() else []
+    mem2 = load_memory(exp2_memory_path) if Path(exp2_memory_path).exists() else []
+
+    def peak_vram_per_rank(mem_rows):
+        """Max peak_allocated_gb across all ranks and steps."""
+        vals = [r["peak_allocated_gb"] for r in mem_rows
+                if isinstance(r.get("peak_allocated_gb"), float)]
+        return max(vals) if vals else float("nan")
+
+    peak_vram_exp1 = peak_vram_per_rank(mem1)
+    peak_vram_exp2 = peak_vram_per_rank(mem2)
+
+    # ── Block-level step-time statistics ──────────────────────────────────────
+    BLOCK_EDGES = [51, 101, 151, 201, 251, 301, 351]
+
+    blocks_exp1 = block_stats(exp1_rows, "step_time_s", BLOCK_EDGES)
+    blocks_exp2 = block_stats(exp2_rows, "step_time_s", BLOCK_EDGES)
+
+    # ── Print comparison table ────────────────────────────────────────────────
+    COL_W = 18
+    def row_line(label, v1, v2, fmt_str=".3f"):
+        diff = pct_diff(v1, v2)
+        diff_str = f"{diff:+.1f}%" if not math.isnan(diff) else "N/A"
+        return (f"  {label:<30} {fmt(v1, fmt_str):>{COL_W}} "
+                f"{fmt(v2, fmt_str):>{COL_W}}   {diff_str}")
+
+    sep = "─" * 80
+    print("\n" + "═" * 80)
+    print(f"  BENCHMARK RESULTS: DP vs EP — Mixtral 8x7B")
+    print("═" * 80)
+    print(f"  {'Metric':<30} {args.exp1_name:>{COL_W}} "
+          f"{args.exp2_name:>{COL_W}}   Δ (ep vs dp)")
+    print(sep)
+
+    for field, label in fields_of_interest:
+        s1 = summaries_exp1[field]
+        s2 = summaries_exp2[field]
+        if math.isnan(s1["mean"]) and math.isnan(s2["mean"]):
+            continue
+        fmt_str = ".0f" if field == "tokens_per_sec" else ".3f"
+        print(row_line(f"{label} [mean]",   s1["mean"],   s2["mean"],   fmt_str))
+        print(row_line(f"{label} [median]", s1["median"], s2["median"], fmt_str))
+        print(row_line(f"{label} [p95]",    s1["p95"],    s2["p95"],    fmt_str))
+        print(row_line(f"{label} [std]",    s1["std"],    s2["std"],    fmt_str))
+        print()
+
+    print(sep)
+    print(row_line("Peak VRAM / rank [GiB]", peak_vram_exp1, peak_vram_exp2, ".2f"))
+    print()
+
+    # ── Block-level table ─────────────────────────────────────────────────────
+    print(sep)
+    print(f"  BLOCK-LEVEL STEP TIME (s)")
+    print(f"  {'Block':<20} {'exp1 mean':>10} {'exp1 p95':>10} "
+          f"{'exp2 mean':>10} {'exp2 p95':>10}   Δ mean")
+    print(sep)
+    for b1, b2 in zip(blocks_exp1, blocks_exp2):
+        diff = pct_diff(b1["mean"], b2["mean"])
+        diff_str = f"{diff:+.1f}%" if not math.isnan(diff) else "N/A"
+        print(f"  {b1['block']:<20} "
+              f"{fmt(b1['mean']):>10} {fmt(b1['p95']):>10} "
+              f"{fmt(b2['mean']):>10} {fmt(b2['p95']):>10}   {diff_str}")
+
+    # ── Loss sanity check ─────────────────────────────────────────────────────
+    print()
+    print(sep)
+    print("  LOSS SANITY")
+    loss1_first = exp1_rows[0]["loss"]  if exp1_rows else None
+    loss1_last  = exp1_rows[-1]["loss"] if exp1_rows else None
+    loss2_first = exp2_rows[0]["loss"]  if exp2_rows else None
+    loss2_last  = exp2_rows[-1]["loss"] if exp2_rows else None
+    print(f"  {args.exp1_name}: first={fmt(loss1_first)}  last={fmt(loss1_last)}")
+    print(f"  {args.exp2_name}: first={fmt(loss2_first)}  last={fmt(loss2_last)}")
+    print()
+    print("═" * 80)
+
+    # ── Write summary CSV ─────────────────────────────────────────────────────
+    summary_path = os.path.join(args.out_dir, "comparison_summary.csv")
+    with open(summary_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["metric", "stat",
+                         args.exp1_name, args.exp2_name, "delta_pct"])
+        for field, label in fields_of_interest:
+            for stat in ["mean", "median", "p95", "std"]:
+                v1 = summaries_exp1[field][stat]
+                v2 = summaries_exp2[field][stat]
+                diff = pct_diff(v1, v2)
+                writer.writerow([label, stat,
+                                 "" if math.isnan(v1) else v1,
+                                 "" if math.isnan(v2) else v2,
+                                 "" if math.isnan(diff) else diff])
+        writer.writerow(["Peak VRAM/rank (GiB)", "max",
+                         peak_vram_exp1, peak_vram_exp2,
+                         pct_diff(peak_vram_exp1, peak_vram_exp2)])
+    print(f"Summary CSV written to: {summary_path}")
+
+    # ── W&B summary table ─────────────────────────────────────────────────────
+    try:
+        import wandb
+        run = wandb.init(
+            project=args.wandb_project,
+            name="comparison_summary",
+            job_type="analysis",
+        )
+
+        # Summary scalars
+        for field, label in fields_of_interest:
+            for stat in ["mean", "median", "p95", "std"]:
+                v1 = summaries_exp1[field][stat]
+                v2 = summaries_exp2[field][stat]
+                if not math.isnan(v1):
+                    wandb.summary[f"exp1/{label}/{stat}"] = v1
+                if not math.isnan(v2):
+                    wandb.summary[f"exp2/{label}/{stat}"] = v2
+                diff = pct_diff(v1, v2)
+                if not math.isnan(diff):
+                    wandb.summary[f"delta_pct/{label}/{stat}"] = diff
+
+        wandb.summary["exp1/peak_vram_gb"] = peak_vram_exp1
+        wandb.summary["exp2/peak_vram_gb"] = peak_vram_exp2
+
+        # Block-level table
+        block_table = wandb.Table(
+            columns=["experiment", "block", "n", "mean_step_s",
+                     "std_step_s", "median_step_s", "p95_step_s"],
+        )
+        for b in blocks_exp1:
+            block_table.add_data(args.exp1_name, b["block"], b["n"],
+                                 b["mean"], b["std"], b["median"], b["p95"])
+        for b in blocks_exp2:
+            block_table.add_data(args.exp2_name, b["block"], b["n"],
+                                 b["mean"], b["std"], b["median"], b["p95"])
+        wandb.log({"block_step_time_table": block_table})
+
+        # Overlay throughput curves (sampled every 5 steps)
+        for rows, exp_name in [(exp1_rows, args.exp1_name),
+                                (exp2_rows, args.exp2_name)]:
+            for r in rows:
+                step = int(r["step"])
+                if step % 5 != 0:
+                    continue
+                payload = {
+                    f"{exp_name}/tokens_per_sec": r.get("tokens_per_sec"),
+                    f"{exp_name}/step_time_s":    r.get("step_time_s"),
+                    f"{exp_name}/loss":           r.get("loss"),
+                    f"{exp_name}/mfu_percent":    r.get("mfu_percent"),
+                }
+                payload = {k: v for k, v in payload.items() if v is not None}
+                wandb.log(payload, step=step)
+
+        wandb.finish()
+        print(f"W&B summary logged to project: {args.wandb_project}")
+
+    except ImportError:
+        print("[WARN] wandb not installed — skipping W&B summary upload")
+    except Exception as e:
+        print(f"[WARN] W&B logging failed: {e}")
 
 
 if __name__ == "__main__":
